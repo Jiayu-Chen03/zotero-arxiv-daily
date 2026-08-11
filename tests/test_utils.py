@@ -186,23 +186,34 @@ def test_send_email_falls_back_to_plain(config, monkeypatch):
     assert len(sent) == 1
 
 
-def test_send_email_reconnects_after_login_disconnect(config, monkeypatch):
+def test_send_email_cycles_auth_methods_after_login_disconnect(config, monkeypatch):
     sent = []
     sleeps = []
     connections = []
+    auth_attempts = []
 
     config.email.smtp_port = 465
 
     class StubSMTP_SSL:
         def __init__(self, *args, **kwargs):
             self.number = len(connections) + 1
+            self.esmtp_features = {"auth": "PLAIN LOGIN"}
             connections.append(self)
 
-        def login(self, user, password):
-            if self.number == 1:
-                raise smtplib.SMTPServerDisconnected(
-                    "Connection unexpectedly closed"
-                )
+        def login(self, user, password, initial_response_ok=True):
+            auth_attempts.append(("automatic", initial_response_ok))
+            raise smtplib.SMTPServerDisconnected(
+                "Connection unexpectedly closed"
+            )
+
+        def ehlo_or_helo_if_needed(self):
+            pass
+
+        def auth(self, mechanism, authobject, initial_response_ok=True):
+            auth_attempts.append((mechanism, initial_response_ok))
+            assert authobject(b"Username:") == "test@example.com"
+            assert authobject(b"Password:") == "test"
+            return 235, b"Authentication successful"
 
         def sendmail(self, sender, recipients, msg):
             sent.append((sender, recipients, msg))
@@ -221,9 +232,45 @@ def test_send_email_reconnects_after_login_disconnect(config, monkeypatch):
 
     send_email(config, "<html>retry login</html>")
 
-    assert len(connections) == 2
-    assert sleeps == [10]
+    assert len(connections) == 3
+    assert sleeps == [10, 20]
+    assert auth_attempts == [
+        ("automatic", True),
+        ("automatic", False),
+        ("LOGIN", False),
+    ]
     assert len(sent) == 1
+
+
+def test_send_email_qq_failure_has_authorization_code_hint(config, monkeypatch):
+    config.email.smtp_server = "smtp.qq.com"
+    config.email.smtp_port = 465
+
+    class StubSMTP_SSL:
+        def __init__(self, *args, **kwargs):
+            self.esmtp_features = {"auth": "LOGIN"}
+
+        def login(self, user, password, initial_response_ok=True):
+            raise smtplib.SMTPServerDisconnected(
+                "Connection unexpectedly closed"
+            )
+
+        def ehlo_or_helo_if_needed(self):
+            pass
+
+        def auth(self, mechanism, authobject, initial_response_ok=True):
+            raise smtplib.SMTPServerDisconnected(
+                "Connection unexpectedly closed"
+            )
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(smtplib, "SMTP_SSL", StubSMTP_SSL)
+    monkeypatch.setattr("zotero_arxiv_daily.utils.sleep", lambda _: None)
+
+    with pytest.raises(RuntimeError, match="16-character authorization code"):
+        send_email(config, "<html>failed login</html>")
 
 
 # ---------------------------------------------------------------------------
