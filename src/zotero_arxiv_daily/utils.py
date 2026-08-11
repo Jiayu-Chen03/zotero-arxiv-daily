@@ -16,6 +16,7 @@ pymupdf.TOOLS.mupdf_display_errors(False)
 pymupdf.layout.activate()
 
 import pymupdf4llm  # noqa: E402
+from time import sleep
 
 _TOKEN_RE = re.compile(r'[a-zA-Z0-9]+')
 
@@ -139,33 +140,103 @@ def glob_match(path:str, pattern:str) -> bool:
     re_pattern = glob.translate(pattern,recursive=True)
     return re.match(re_pattern, path) is not None
 
-def send_email(config:DictConfig, html:str):
+def send_email(config: DictConfig, html: str):
     sender = config.email.sender
     receiver = config.email.receiver
     password = config.email.sender_password
     smtp_server = config.email.smtp_server
-    smtp_port = config.email.smtp_port
+    smtp_port = int(config.email.smtp_port)
+
+    max_retries = 3
+    retry_delay = 10
+    timeout = 30
+
     def _format_addr(s):
         name, addr = parseaddr(s)
-        return formataddr((Header(name, 'utf-8').encode(), addr))
+        return formataddr((Header(name, "utf-8").encode(), addr))
 
-    msg = MIMEText(html, 'html', 'utf-8')
-    msg['From'] = _format_addr('Github Action <%s>' % sender)
-    msg['To'] = _format_addr('You <%s>' % receiver)
-    today = datetime.datetime.now().strftime('%Y/%m/%d')
-    msg['Subject'] = Header(f'Daily arXiv {today}', 'utf-8').encode()
+    msg = MIMEText(html, "html", "utf-8")
+    msg["From"] = _format_addr(f"Github Action <{sender}>")
+    msg["To"] = _format_addr(f"You <{receiver}>")
 
-    try:
-        server = smtplib.SMTP(smtp_server, smtp_port)
-        server.starttls()
-    except Exception as e:
-        logger.debug(f"Failed to use TLS. {e}\nTry to use SSL.")
+    today = datetime.datetime.now().strftime("%Y/%m/%d")
+    msg["Subject"] = Header(f"Daily arXiv {today}", "utf-8").encode()
+
+    last_exception = None
+
+    for attempt in range(1, max_retries + 1):
+        server = None
+
         try:
-            server = smtplib.SMTP_SSL(smtp_server, smtp_port)
-        except Exception as e:
-            logger.debug(f"Failed to use SSL. {e}\nTry to use plain text.")
-            server = smtplib.SMTP(smtp_server, smtp_port)
+            logger.info(
+                f"Connecting to SMTP server "
+                f"{smtp_server}:{smtp_port}, attempt {attempt}/{max_retries}"
+            )
 
-    server.login(sender, password)
-    server.sendmail(sender, [receiver], msg.as_string())
-    server.quit()
+            # Port 465 uses implicit SSL.
+            if smtp_port == 465:
+                server = smtplib.SMTP_SSL(
+                    smtp_server,
+                    smtp_port,
+                    timeout=timeout,
+                )
+
+            # Port 587 generally uses STARTTLS.
+            else:
+                server = smtplib.SMTP(
+                    smtp_server,
+                    smtp_port,
+                    timeout=timeout,
+                )
+                server.ehlo()
+                server.starttls()
+                server.ehlo()
+
+            logger.info("SMTP connected, logging in...")
+
+            server.login(sender, password)
+
+            logger.info("SMTP login successful, sending email...")
+
+            server.sendmail(
+                sender,
+                [receiver],
+                msg.as_string(),
+            )
+
+            logger.info("Email sent successfully.")
+
+            try:
+                server.quit()
+            except Exception:
+                server.close()
+
+            return
+
+        except (
+            smtplib.SMTPException,
+            ConnectionError,
+            TimeoutError,
+            OSError,
+        ) as exc:
+            last_exception = exc
+
+            logger.warning(
+                f"Email sending failed "
+                f"(attempt {attempt}/{max_retries}): "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+            if server is not None:
+                try:
+                    server.close()
+                except Exception:
+                    pass
+
+            if attempt < max_retries:
+                sleep(retry_delay * attempt)
+
+    raise RuntimeError(
+        f"Failed to send email after {max_retries} attempts: "
+        f"{type(last_exception).__name__}: {last_exception}"
+    ) from last_exception
