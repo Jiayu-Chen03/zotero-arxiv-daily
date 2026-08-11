@@ -167,6 +167,7 @@ def test_run_end_to_end(config, monkeypatch):
         config.executor.source = ["arxiv"]
         config.executor.reranker = "api"
         config.executor.send_empty = False
+        config.executor.max_paper_num = 1
 
     # 1. Stub pyzotero
     stub_zot = make_stub_zotero_client()
@@ -191,6 +192,12 @@ def test_run_end_to_end(config, monkeypatch):
         "retrieve_papers",
         lambda self: retrieved,
     )
+    enriched = []
+    monkeypatch.setattr(
+        registered_retrievers["arxiv"],
+        "enrich_paper",
+        lambda self, paper: enriched.append(paper.title),
+    )
 
     # 4. Stub SMTP
     sent = []
@@ -205,6 +212,7 @@ def test_run_end_to_end(config, monkeypatch):
 
     # Assertions
     assert len(sent) == 1, "Email should have been sent"
+    assert len(enriched) == 1, "Only selected papers should fetch full text"
     _, _, email_body = sent[0]
     assert "text/html" in email_body
 
