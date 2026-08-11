@@ -141,10 +141,10 @@ def glob_match(path:str, pattern:str) -> bool:
     return re.match(re_pattern, path) is not None
 
 def send_email(config: DictConfig, html: str):
-    sender = config.email.sender
-    receiver = config.email.receiver
-    password = config.email.sender_password
-    smtp_server = config.email.smtp_server
+    sender = str(config.email.sender).strip()
+    receiver = str(config.email.receiver).strip()
+    password = str(config.email.sender_password).strip()
+    smtp_server = str(config.email.smtp_server).strip()
     smtp_port = int(config.email.smtp_port)
 
     max_retries = 3
@@ -223,6 +223,39 @@ def send_email(config: DictConfig, html: str):
             timeout=timeout,
         )
 
+    def _authenticate(server, attempt):
+        """Try progressively more conservative SMTP AUTH handshakes."""
+        if attempt == 1:
+            logger.info("Authenticating with automatic SMTP AUTH negotiation...")
+            return server.login(sender, password)
+
+        if attempt == 2:
+            logger.info("Authenticating without a SASL initial response...")
+            return server.login(
+                sender,
+                password,
+                initial_response_ok=False,
+            )
+
+        logger.info("Authenticating with explicit two-step AUTH LOGIN...")
+        server.ehlo_or_helo_if_needed()
+        advertised_auth = server.esmtp_features.get("auth", "").upper().split()
+        if "LOGIN" not in advertised_auth:
+            raise smtplib.SMTPNotSupportedError(
+                "SMTP server does not advertise AUTH LOGIN"
+            )
+
+        responses = iter((sender, password))
+
+        def _login_response(_challenge=None):
+            return next(responses, "")
+
+        return server.auth(
+            "LOGIN",
+            _login_response,
+            initial_response_ok=False,
+        )
+
     for attempt in range(1, max_retries + 1):
         server = None
 
@@ -236,7 +269,7 @@ def send_email(config: DictConfig, html: str):
 
             logger.info("SMTP connected, logging in...")
 
-            server.login(sender, password)
+            _authenticate(server, attempt)
 
             logger.info("SMTP login successful, sending email...")
 
@@ -269,7 +302,15 @@ def send_email(config: DictConfig, html: str):
             if attempt < max_retries:
                 sleep(retry_delay * attempt)
 
+    provider_hint = ""
+    if smtp_server.lower() == "smtp.qq.com":
+        provider_hint = (
+            " QQ Mail requires POP3/IMAP/SMTP to be enabled and "
+            "SENDER_PASSWORD to contain a current 16-character authorization "
+            "code, not the QQ account password."
+        )
+
     raise RuntimeError(
         f"Failed to send email after {max_retries} attempts: "
-        f"{type(last_exception).__name__}: {last_exception}"
+        f"{type(last_exception).__name__}: {last_exception}.{provider_hint}"
     ) from last_exception
