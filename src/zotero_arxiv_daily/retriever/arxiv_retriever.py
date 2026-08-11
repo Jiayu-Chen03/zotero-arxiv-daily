@@ -1,15 +1,13 @@
 from .base import BaseRetriever, register_retriever
-import arxiv
-from arxiv import Result as ArxivResult
 from ..protocol import Paper
 from ..utils import extract_markdown_from_pdf, extract_tex_code_from_tar
+from dataclasses import dataclass
 from tempfile import TemporaryDirectory
 import feedparser
-from tqdm import tqdm
 import multiprocessing
 import os
+import re
 from queue import Empty
-from time import sleep
 from typing import Any, Callable, TypeVar
 from loguru import logger
 import requests
@@ -19,6 +17,51 @@ T = TypeVar("T")
 DOWNLOAD_TIMEOUT = (10, 60)
 PDF_EXTRACT_TIMEOUT = 180
 TAR_EXTRACT_TIMEOUT = 180
+
+
+@dataclass(frozen=True)
+class ArxivFeedAuthor:
+    name: str
+
+
+@dataclass(frozen=True)
+class ArxivFeedResult:
+    """The subset of arXiv metadata needed by the recommendation pipeline."""
+
+    paper_id: str
+    title: str
+    authors: list[ArxivFeedAuthor]
+    summary: str
+    entry_id: str
+    pdf_url: str
+
+    def source_url(self) -> str:
+        return f"https://arxiv.org/e-print/{self.paper_id}"
+
+
+def _clean_rss_summary(summary: str) -> str:
+    """Remove the announcement header prepended to arXiv RSS abstracts."""
+    summary = re.sub(
+        r"^\s*arXiv:\S+\s+Announce Type:\s*\S+\s*",
+        "",
+        summary,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+    return re.sub(r"^Abstract:\s*", "", summary, count=1, flags=re.IGNORECASE).strip()
+
+
+def _result_from_rss_entry(entry: Any) -> ArxivFeedResult:
+    paper_id = entry.id.removeprefix("oai:arXiv.org:")
+    author_names = [name.strip() for name in entry.get("author", "").split(",") if name.strip()]
+    return ArxivFeedResult(
+        paper_id=paper_id,
+        title=entry.title.strip(),
+        authors=[ArxivFeedAuthor(name) for name in author_names],
+        summary=_clean_rss_summary(entry.get("summary", "")),
+        entry_id=f"https://arxiv.org/abs/{paper_id}",
+        pdf_url=f"https://arxiv.org/pdf/{paper_id}",
+    )
 
 
 def _download_file(url: str, path: str) -> None:
@@ -113,59 +156,32 @@ class ArxivRetriever(BaseRetriever):
         if self.config.source.arxiv.category is None:
             raise ValueError("category must be specified for arxiv.")
 
-    def _retrieve_raw_papers(self) -> list[ArxivResult]:
-        client = arxiv.Client(num_retries=10, delay_seconds=10)
+    def _retrieve_raw_papers(self) -> list[ArxivFeedResult]:
         query = '+'.join(self.config.source.arxiv.category)
         include_cross_list = self.config.source.arxiv.get("include_cross_list", False)
         # Get the latest paper from arxiv rss feed
         feed = feedparser.parse(f"https://rss.arxiv.org/atom/{query}")
         if 'Feed error for query' in feed.feed.title:
             raise Exception(f"Invalid ARXIV_QUERY: {query}.")
-        raw_papers = []
         allowed_announce_types = {"new", "cross"} if include_cross_list else {"new"}
-        all_paper_ids = [
-            i.id.removeprefix("oai:arXiv.org:")
-            for i in feed.entries
-            if i.get("arxiv_announce_type", "new") in allowed_announce_types
+        entries = [
+            entry
+            for entry in feed.entries
+            if entry.get("arxiv_announce_type", "new") in allowed_announce_types
         ]
         if self.config.executor.debug:
-            all_paper_ids = all_paper_ids[:10]
+            entries = entries[:10]
 
-        # Get full information of each paper from arxiv api
-        bar = tqdm(total=len(all_paper_ids))
-        max_batch_retries = 5
-        batch_retry_delay = 30
-        for i in range(0, len(all_paper_ids), 20):
-            search = arxiv.Search(id_list=all_paper_ids[i:i + 20])
-            for attempt in range(max_batch_retries):
-                try:
-                    batch = list(client.results(search))
-                    bar.update(len(batch))
-                    raw_papers.extend(batch)
-                    break
-                except arxiv.HTTPError as exc:
-                    if exc.status == 429 and attempt < max_batch_retries - 1:
-                        wait = batch_retry_delay * (attempt + 1)
-                        logger.warning(f"arXiv API 429 on batch {i // 20}, retry {attempt + 1}/{max_batch_retries} in {wait}s")
-                        sleep(wait)
-                    else:
-                        raise
-            if i + 20 < len(all_paper_ids):
-                sleep(3)
-        bar.close()
+        # RSS already contains every metadata field required for reranking. Using
+        # it directly avoids dozens of redundant legacy API calls and the 429/503
+        # failures those calls can trigger on high-volume announcement days.
+        return [_result_from_rss_entry(entry) for entry in entries]
 
-        return raw_papers
-
-    def convert_to_paper(self, raw_paper: ArxivResult) -> Paper:
+    def convert_to_paper(self, raw_paper: ArxivFeedResult) -> Paper:
         title = raw_paper.title
         authors = [a.name for a in raw_paper.authors]
         abstract = raw_paper.summary
         pdf_url = raw_paper.pdf_url
-        full_text = extract_text_from_tar(raw_paper)
-        if full_text is None:
-            full_text = extract_text_from_html(raw_paper)
-        if full_text is None:
-            full_text = extract_text_from_pdf(raw_paper)
         return Paper(
             source=self.name,
             title=title,
@@ -173,11 +189,27 @@ class ArxivRetriever(BaseRetriever):
             abstract=abstract,
             url=raw_paper.entry_id,
             pdf_url=pdf_url,
-            full_text=full_text,
         )
 
+    def enrich_paper(self, paper: Paper) -> None:
+        paper_id = paper.url.rsplit("/", 1)[-1]
+        resource = ArxivFeedResult(
+            paper_id=paper_id,
+            title=paper.title,
+            authors=[ArxivFeedAuthor(name) for name in paper.authors],
+            summary=paper.abstract,
+            entry_id=paper.url,
+            pdf_url=paper.pdf_url or f"https://arxiv.org/pdf/{paper_id}",
+        )
+        full_text = extract_text_from_tar(resource)
+        if full_text is None:
+            full_text = extract_text_from_html(resource)
+        if full_text is None:
+            full_text = extract_text_from_pdf(resource)
+        paper.full_text = full_text
 
-def extract_text_from_html(paper: ArxivResult) -> str | None:
+
+def extract_text_from_html(paper: ArxivFeedResult) -> str | None:
     html_url = paper.entry_id.replace("/abs/", "/html/")
     try:
         return _extract_text_from_html_worker(html_url)
@@ -186,7 +218,7 @@ def extract_text_from_html(paper: ArxivResult) -> str | None:
         return None
 
 
-def extract_text_from_pdf(paper: ArxivResult) -> str | None:
+def extract_text_from_pdf(paper: ArxivFeedResult) -> str | None:
     if paper.pdf_url is None:
         logger.warning(f"No PDF URL available for {paper.title}")
         return None
@@ -199,7 +231,7 @@ def extract_text_from_pdf(paper: ArxivResult) -> str | None:
     )
 
 
-def extract_text_from_tar(paper: ArxivResult) -> str | None:
+def extract_text_from_tar(paper: ArxivFeedResult) -> str | None:
     source_url = paper.source_url()
     if source_url is None:
         logger.warning(f"No source URL available for {paper.title}")
