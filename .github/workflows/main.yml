@@ -10,9 +10,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
-        with:
-          repository: ${{ vars.REPOSITORY }}
-          ref: ${{ vars.REF }}
+
+      - name: Show checked-out revision
+        run: git show -s --format='%H %s' HEAD
 
       - name: Setup uv
         uses: astral-sh/setup-uv@v7
