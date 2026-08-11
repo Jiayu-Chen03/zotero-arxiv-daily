@@ -164,6 +164,65 @@ def send_email(config: DictConfig, html: str):
 
     last_exception = None
 
+    connection_errors = (
+        smtplib.SMTPException,
+        ConnectionError,
+        TimeoutError,
+        OSError,
+    )
+
+    def _close(server):
+        if server is not None:
+            try:
+                server.close()
+            except Exception:
+                pass
+
+    def _connect():
+        """Connect using implicit SSL, STARTTLS, or a plain SMTP fallback."""
+        if smtp_port == 465:
+            return smtplib.SMTP_SSL(
+                smtp_server,
+                smtp_port,
+                timeout=timeout,
+            )
+
+        tls_server = None
+        try:
+            tls_server = smtplib.SMTP(
+                smtp_server,
+                smtp_port,
+                timeout=timeout,
+            )
+            # starttls() performs EHLO when needed. Avoid requiring SMTP-like
+            # implementations to expose ehlo() separately.
+            tls_server.starttls()
+            return tls_server
+        except connection_errors as exc:
+            _close(tls_server)
+            logger.warning(
+                f"STARTTLS connection failed: {type(exc).__name__}: {exc}; "
+                "trying implicit SSL."
+            )
+
+        try:
+            return smtplib.SMTP_SSL(
+                smtp_server,
+                smtp_port,
+                timeout=timeout,
+            )
+        except connection_errors as exc:
+            logger.warning(
+                f"SSL connection failed: {type(exc).__name__}: {exc}; "
+                "trying plain SMTP."
+            )
+
+        return smtplib.SMTP(
+            smtp_server,
+            smtp_port,
+            timeout=timeout,
+        )
+
     for attempt in range(1, max_retries + 1):
         server = None
 
@@ -173,24 +232,7 @@ def send_email(config: DictConfig, html: str):
                 f"{smtp_server}:{smtp_port}, attempt {attempt}/{max_retries}"
             )
 
-            # Port 465 uses implicit SSL.
-            if smtp_port == 465:
-                server = smtplib.SMTP_SSL(
-                    smtp_server,
-                    smtp_port,
-                    timeout=timeout,
-                )
-
-            # Port 587 generally uses STARTTLS.
-            else:
-                server = smtplib.SMTP(
-                    smtp_server,
-                    smtp_port,
-                    timeout=timeout,
-                )
-                server.ehlo()
-                server.starttls()
-                server.ehlo()
+            server = _connect()
 
             logger.info("SMTP connected, logging in...")
 
@@ -213,12 +255,7 @@ def send_email(config: DictConfig, html: str):
 
             return
 
-        except (
-            smtplib.SMTPException,
-            ConnectionError,
-            TimeoutError,
-            OSError,
-        ) as exc:
+        except connection_errors as exc:
             last_exception = exc
 
             logger.warning(
@@ -227,11 +264,7 @@ def send_email(config: DictConfig, html: str):
                 f"{type(exc).__name__}: {exc}"
             )
 
-            if server is not None:
-                try:
-                    server.close()
-                except Exception:
-                    pass
+            _close(server)
 
             if attempt < max_retries:
                 sleep(retry_delay * attempt)
