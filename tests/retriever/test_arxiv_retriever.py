@@ -18,49 +18,49 @@ def _raise_runtime_error() -> None:
     raise RuntimeError("boom")
 
 
-def test_arxiv_retriever(config, mock_feedparser, monkeypatch):
+def test_arxiv_retriever_uses_rss_metadata(config, mock_feedparser, monkeypatch):
     monkeypatch.setattr("zotero_arxiv_daily.retriever.base.sleep", lambda _: None)
 
-    # The RSS fixture gives us paper IDs.  After feedparser, the code calls
-    # arxiv.Client().results(search) which makes real HTTP requests.  We mock
-    # the arxiv Client so the test stays offline.
     new_entries = [
         e for e in mock_feedparser.entries
         if e.get("arxiv_announce_type", "new") == "new"
     ]
-    paper_ids = [e.id.removeprefix("oai:arXiv.org:") for e in new_entries]
 
-    # Build fake ArxivResult-like objects matching each RSS entry
-    fake_results = []
-    for entry in new_entries:
-        pid = entry.id.removeprefix("oai:arXiv.org:")
-        fake_results.append(SimpleNamespace(
-            title=entry.title,
-            authors=[SimpleNamespace(name="Test Author")],
-            summary="Test abstract",
-            pdf_url=f"https://arxiv.org/pdf/{pid}",
-            entry_id=f"https://arxiv.org/abs/{pid}",
-            source_url=lambda pid=pid: f"https://arxiv.org/e-print/{pid}",
-        ))
+    def fail_if_called(_paper):
+        raise AssertionError("full text must not be fetched before reranking")
 
-    class FakeClient:
-        def __init__(self, **kw):
-            pass
-        def results(self, search):
-            return iter(fake_results)
-
-    monkeypatch.setattr(arxiv_retriever.arxiv, "Client", FakeClient)
-
-    # Skip file downloads in convert_to_paper
-    monkeypatch.setattr(arxiv_retriever, "extract_text_from_html", lambda paper: None)
-    monkeypatch.setattr(arxiv_retriever, "extract_text_from_pdf", lambda paper: None)
-    monkeypatch.setattr(arxiv_retriever, "extract_text_from_tar", lambda paper: None)
+    monkeypatch.setattr(arxiv_retriever, "extract_text_from_html", fail_if_called)
+    monkeypatch.setattr(arxiv_retriever, "extract_text_from_pdf", fail_if_called)
+    monkeypatch.setattr(arxiv_retriever, "extract_text_from_tar", fail_if_called)
 
     retriever = ArxivRetriever(config)
     papers = retriever.retrieve_papers()
 
     assert len(papers) == len(new_entries)
     assert set(p.title for p in papers) == set(e.title for e in new_entries)
+    assert papers[0].authors == ["Alice Smith", "Bob Jones"]
+    assert papers[0].abstract == "We propose a neural architecture search method for efficient transformers."
+    assert papers[0].url == "https://arxiv.org/abs/2508.14001v1"
+    assert papers[0].full_text is None
+
+
+def test_arxiv_retriever_enriches_only_when_requested(config, monkeypatch):
+    calls = []
+    monkeypatch.setattr(arxiv_retriever, "extract_text_from_tar", lambda paper: calls.append(paper.paper_id) or "full text")
+
+    paper = SimpleNamespace(
+        source="arxiv",
+        title="Selected paper",
+        authors=["Test Author"],
+        abstract="Abstract",
+        url="https://arxiv.org/abs/2608.00001v1",
+        pdf_url="https://arxiv.org/pdf/2608.00001v1",
+        full_text=None,
+    )
+    ArxivRetriever(config).enrich_paper(paper)
+
+    assert calls == ["2608.00001v1"]
+    assert paper.full_text == "full text"
 
 
 def test_run_with_hard_timeout_returns_value():
