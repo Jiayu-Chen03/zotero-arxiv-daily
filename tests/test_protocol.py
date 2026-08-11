@@ -55,6 +55,13 @@ def test_tldr_truncates_long_prompt(llm_params):
     assert result is not None
 
 
+def test_tldr_accepts_literal_special_tokens(llm_params):
+    client = make_stub_openai_client()
+    paper = make_sample_paper(full_text="content before <|endoftext|> content after")
+    result = paper.generate_tldr(client, llm_params)
+    assert result == "Hello! How can I assist you today?"
+
+
 # ---------------------------------------------------------------------------
 # generate_affiliations
 # ---------------------------------------------------------------------------
@@ -122,3 +129,10 @@ def test_affiliations_error_returns_none(llm_params):
     result = paper.generate_affiliations(broken_client, llm_params)
     assert result is None
     assert paper.affiliations is None
+
+
+def test_affiliations_accepts_literal_special_tokens(llm_params):
+    client = make_stub_openai_client()
+    paper = make_sample_paper(full_text="content before <|endoftext|> content after")
+    result = paper.generate_affiliations(client, llm_params)
+    assert isinstance(result, list)
