@@ -186,6 +186,46 @@ def test_send_email_falls_back_to_plain(config, monkeypatch):
     assert len(sent) == 1
 
 
+def test_send_email_reconnects_after_login_disconnect(config, monkeypatch):
+    sent = []
+    sleeps = []
+    connections = []
+
+    config.email.smtp_port = 465
+
+    class StubSMTP_SSL:
+        def __init__(self, *args, **kwargs):
+            self.number = len(connections) + 1
+            connections.append(self)
+
+        def login(self, user, password):
+            if self.number == 1:
+                raise smtplib.SMTPServerDisconnected(
+                    "Connection unexpectedly closed"
+                )
+
+        def sendmail(self, sender, recipients, msg):
+            sent.append((sender, recipients, msg))
+
+        def quit(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(smtplib, "SMTP_SSL", StubSMTP_SSL)
+    monkeypatch.setattr(
+        "zotero_arxiv_daily.utils.sleep",
+        lambda seconds: sleeps.append(seconds),
+    )
+
+    send_email(config, "<html>retry login</html>")
+
+    assert len(connections) == 2
+    assert sleeps == [10]
+    assert len(sent) == 1
+
+
 # ---------------------------------------------------------------------------
 # extract_tex_code_from_tar
 # ---------------------------------------------------------------------------
