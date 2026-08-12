@@ -217,6 +217,58 @@ def test_run_end_to_end(config, monkeypatch):
     assert "text/html" in email_body
 
 
+def test_run_stops_llm_calls_after_connection_error(config, monkeypatch):
+    from omegaconf import open_dict
+    from tests.canned_responses import make_sample_corpus, make_sample_paper
+
+    with open_dict(config):
+        config.executor.max_paper_num = 2
+
+    papers = [
+        make_sample_paper(title="Paper 1"),
+        make_sample_paper(title="Paper 2"),
+    ]
+    calls = []
+
+    executor = Executor.__new__(Executor)
+    executor.config = config
+    executor.openai_client = object()
+    executor.fetch_zotero_corpus = lambda: make_sample_corpus()
+    executor.filter_corpus = lambda corpus: corpus
+    executor.reranker = type(
+        "StubReranker",
+        (),
+        {"rerank": lambda self, candidates, corpus: candidates},
+    )()
+    executor.retrievers = {
+        "arxiv": type(
+            "StubRetriever",
+            (),
+            {
+                "retrieve_papers": lambda self: papers,
+                "enrich_paper": lambda self, paper: None,
+            },
+        )()
+    }
+
+    def fail_first_tldr(self, client, llm_params):
+        calls.append(self.title)
+        self.tldr = self.abstract
+        self.llm_connection_error = True
+        return self.tldr
+
+    monkeypatch.setattr(type(papers[0]), "generate_tldr", fail_first_tldr)
+    monkeypatch.setattr(
+        "zotero_arxiv_daily.executor.send_email",
+        lambda config, html: None,
+    )
+
+    executor.run()
+
+    assert calls == ["Paper 1"]
+    assert papers[1].tldr == papers[1].abstract
+
+
 def test_run_no_papers_send_empty_false(config, monkeypatch):
     """When no papers are found and send_empty=false, no email is sent."""
     import smtplib
