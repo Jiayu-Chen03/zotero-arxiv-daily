@@ -112,10 +112,31 @@ class Executor:
             reranked_papers = self.reranker.rerank(all_papers, corpus)
             reranked_papers = reranked_papers[:self.config.executor.max_paper_num]
             logger.info("Fetching full text and generating TLDR and affiliations...")
+            llm_available = True
             for p in tqdm(reranked_papers):
                 self.retrievers[p.source].enrich_paper(p)
+                if not llm_available:
+                    p.tldr = p.abstract
+                    continue
+
                 p.generate_tldr(self.openai_client, self.config.llm)
+                if p.llm_connection_error:
+                    llm_available = False
+                    logger.warning(
+                        "LLM endpoint is unreachable; skipping remaining LLM "
+                        "requests and using paper abstracts as TLDRs. Check "
+                        "OPENAI_API_BASE and OPENAI_API_KEY."
+                    )
+                    continue
+
                 p.generate_affiliations(self.openai_client, self.config.llm)
+                if p.llm_connection_error:
+                    llm_available = False
+                    logger.warning(
+                        "LLM endpoint is unreachable; skipping remaining LLM "
+                        "requests and using paper abstracts as TLDRs. Check "
+                        "OPENAI_API_BASE and OPENAI_API_KEY."
+                    )
         elif not self.config.executor.send_empty:
             logger.info("No new papers found. No email will be sent.")
             return
