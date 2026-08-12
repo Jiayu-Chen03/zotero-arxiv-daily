@@ -1,6 +1,8 @@
 """Tests for zotero_arxiv_daily.protocol: Paper.generate_tldr, Paper.generate_affiliations."""
 
 import pytest
+import httpx
+from openai import APIConnectionError
 
 from tests.canned_responses import make_sample_paper, make_stub_openai_client
 
@@ -46,6 +48,28 @@ def test_tldr_falls_back_to_abstract_on_error(llm_params):
     )
     result = paper.generate_tldr(broken_client, llm_params)
     assert result == paper.abstract
+    assert not paper.llm_connection_error
+
+
+def test_tldr_marks_connection_error(llm_params):
+    paper = make_sample_paper()
+
+    from types import SimpleNamespace
+
+    broken_client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(
+                create=lambda **kw: (_ for _ in ()).throw(
+                    APIConnectionError(request=httpx.Request("POST", "https://api.example/v1"))
+                )
+            )
+        )
+    )
+
+    result = paper.generate_tldr(broken_client, llm_params)
+
+    assert result == paper.abstract
+    assert paper.llm_connection_error
 
 
 def test_tldr_truncates_long_prompt(llm_params):

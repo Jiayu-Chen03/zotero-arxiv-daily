@@ -223,21 +223,8 @@ def send_email(config: DictConfig, html: str):
             timeout=timeout,
         )
 
-    def _authenticate(server, attempt):
-        """Try progressively more conservative SMTP AUTH handshakes."""
-        if attempt == 1:
-            logger.info("Authenticating with automatic SMTP AUTH negotiation...")
-            return server.login(sender, password)
-
-        if attempt == 2:
-            logger.info("Authenticating without a SASL initial response...")
-            return server.login(
-                sender,
-                password,
-                initial_response_ok=False,
-            )
-
-        logger.info("Authenticating with explicit two-step AUTH LOGIN...")
+    def _auth_login(server):
+        """Authenticate with a two-step LOGIN exchange."""
         server.ehlo_or_helo_if_needed()
         advertised_auth = server.esmtp_features.get("auth", "").upper().split()
         if "LOGIN" not in advertised_auth:
@@ -255,6 +242,29 @@ def send_email(config: DictConfig, html: str):
             _login_response,
             initial_response_ok=False,
         )
+
+    def _authenticate(server, attempt):
+        """Select a compatible SMTP AUTH handshake."""
+        if smtp_server.lower() == "smtp.qq.com":
+            # QQ rejects AUTH PLAIN from some cloud runners. Go directly to
+            # the LOGIN mechanism advertised by smtp.qq.com.
+            logger.info("Authenticating to QQ Mail with two-step AUTH LOGIN...")
+            return _auth_login(server)
+
+        if attempt == 1:
+            logger.info("Authenticating with automatic SMTP AUTH negotiation...")
+            return server.login(sender, password)
+
+        if attempt == 2:
+            logger.info("Authenticating without a SASL initial response...")
+            return server.login(
+                sender,
+                password,
+                initial_response_ok=False,
+            )
+
+        logger.info("Authenticating with explicit two-step AUTH LOGIN...")
+        return _auth_login(server)
 
     for attempt in range(1, max_retries + 1):
         server = None
@@ -299,6 +309,16 @@ def send_email(config: DictConfig, html: str):
 
             _close(server)
 
+            if (
+                isinstance(exc, smtplib.SMTPAuthenticationError)
+                and exc.smtp_code in {502, 535}
+            ):
+                logger.error(
+                    "SMTP server permanently rejected authentication; "
+                    "not retrying to avoid account frequency limits."
+                )
+                break
+
             if attempt < max_retries:
                 sleep(retry_delay * attempt)
 
@@ -307,7 +327,8 @@ def send_email(config: DictConfig, html: str):
         provider_hint = (
             " QQ Mail requires POP3/IMAP/SMTP to be enabled and "
             "SENDER_PASSWORD to contain a current 16-character authorization "
-            "code, not the QQ account password."
+            "code, not the QQ account password. QQ Mail's Email Login "
+            "Protection must also be disabled because it blocks SMTP access."
         )
 
     raise RuntimeError(
