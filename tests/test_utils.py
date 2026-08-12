@@ -245,32 +245,37 @@ def test_send_email_cycles_auth_methods_after_login_disconnect(config, monkeypat
 def test_send_email_qq_failure_has_authorization_code_hint(config, monkeypatch):
     config.email.smtp_server = "smtp.qq.com"
     config.email.smtp_port = 465
+    connections = []
+    sleeps = []
 
     class StubSMTP_SSL:
         def __init__(self, *args, **kwargs):
             self.esmtp_features = {"auth": "LOGIN"}
+            connections.append(self)
 
         def login(self, user, password, initial_response_ok=True):
-            raise smtplib.SMTPServerDisconnected(
-                "Connection unexpectedly closed"
-            )
+            raise AssertionError("QQ Mail must use explicit AUTH LOGIN")
 
         def ehlo_or_helo_if_needed(self):
             pass
 
         def auth(self, mechanism, authobject, initial_response_ok=True):
-            raise smtplib.SMTPServerDisconnected(
-                "Connection unexpectedly closed"
-            )
+            raise smtplib.SMTPAuthenticationError(535, b"Login fail")
 
         def close(self):
             pass
 
     monkeypatch.setattr(smtplib, "SMTP_SSL", StubSMTP_SSL)
-    monkeypatch.setattr("zotero_arxiv_daily.utils.sleep", lambda _: None)
+    monkeypatch.setattr(
+        "zotero_arxiv_daily.utils.sleep",
+        lambda seconds: sleeps.append(seconds),
+    )
 
-    with pytest.raises(RuntimeError, match="16-character authorization code"):
+    with pytest.raises(RuntimeError, match="Email Login Protection"):
         send_email(config, "<html>failed login</html>")
+
+    assert len(connections) == 1
+    assert sleeps == []
 
 
 # ---------------------------------------------------------------------------
