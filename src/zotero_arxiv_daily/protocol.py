@@ -1,9 +1,9 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, TypeVar
 from datetime import datetime
 import re
 import tiktoken
-from openai import OpenAI
+from openai import APIConnectionError, OpenAI
 from loguru import logger
 import json
 RawPaperItem = TypeVar('RawPaperItem')
@@ -20,6 +20,7 @@ class Paper:
     tldr: Optional[str] = None
     affiliations: Optional[list[str]] = None
     score: Optional[float] = None
+    llm_connection_error: bool = field(default=False, init=False, repr=False)
 
     def _generate_tldr_with_llm(self, openai_client:OpenAI,llm_params:dict) -> str:
         lang = llm_params.get('language', 'English')
@@ -57,11 +58,13 @@ class Paper:
         return tldr
     
     def generate_tldr(self, openai_client:OpenAI,llm_params:dict) -> str:
+        self.llm_connection_error = False
         try:
             tldr = self._generate_tldr_with_llm(openai_client,llm_params)
             self.tldr = tldr
             return tldr
         except Exception as e:
+            self.llm_connection_error = isinstance(e, APIConnectionError)
             logger.warning(f"Failed to generate tldr of {self.url}: {e}")
             tldr = self.abstract
             self.tldr = tldr
@@ -95,11 +98,13 @@ class Paper:
             return affiliations
     
     def generate_affiliations(self, openai_client:OpenAI,llm_params:dict) -> Optional[list[str]]:
+        self.llm_connection_error = False
         try:
             affiliations = self._generate_affiliations_with_llm(openai_client,llm_params)
             self.affiliations = affiliations
             return affiliations
         except Exception as e:
+            self.llm_connection_error = isinstance(e, APIConnectionError)
             logger.warning(f"Failed to generate affiliations of {self.url}: {e}")
             self.affiliations = None
             return None
