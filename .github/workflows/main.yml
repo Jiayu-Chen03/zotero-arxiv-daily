@@ -1,12 +1,23 @@
 name: Send emails daily
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/main.yml']
   schedule:
-    - cron: '0 22 * * *'
+    # 10:17 Monday–Friday in Beijing, after the arXiv announcement.
+    - cron: '17 2 * * 1-5'
+
+concurrency:
+  group: arxiv-digest
+  cancel-in-progress: false
 
 jobs:
   calculate-and-send:
-    runs-on: ubuntu-latest
+    if: github.event_name != 'push' || github.event.head_commit.message == 'Fix scheduled arXiv digest delivery'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -16,6 +27,28 @@ jobs:
 
       - name: Setup uv
         uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.13.9"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Restore delivery history
+        id: restore-history
+        shell: bash
+        run: |
+          remote="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          ref=refs/heads/arxiv-digest-state
+          state_dir="$RUNNER_TEMP/arxiv-digest-state"
+          state_file="$state_dir/state.json"
+          tip=$(git ls-remote "$remote" "$ref")
+          if [[ -n "$tip" ]]; then
+            git fetch --no-tags "$remote" "$ref"
+            git worktree add --detach "$state_dir" FETCH_HEAD
+            test -s "$state_file"
+          else
+            git worktree add --orphan -b arxiv-digest-state "$state_dir"
+          fi
+          printf 'ARXIV_DIGEST_STATE=%s\n' "$state_file" >> "$GITHUB_ENV"
 
       - name: Run script
         env:
@@ -29,6 +62,28 @@ jobs:
           CUSTOM_CONFIG: ${{ vars.CUSTOM_CONFIG }}
         run: |
           printf "%b\n" "$CUSTOM_CONFIG" > config/custom.yaml
-          echo "Use custom config: "
-          cat config/custom.yaml
-          uv run src/zotero_arxiv_daily/main.py
+          uv run --locked src/zotero_arxiv_daily/main.py
+
+      - name: Save delivery history
+        if: steps.restore-history.outcome == 'success' && !cancelled()
+        shell: bash
+        run: |
+          if [[ ! -f "$ARXIV_DIGEST_STATE" ]]; then
+            exit 0
+          fi
+          state_dir=$(dirname "$ARXIV_DIGEST_STATE")
+          git -C "$state_dir" add state.json
+          if ! git -C "$state_dir" diff --cached --quiet; then
+            git -C "$state_dir" -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              commit --quiet -m 'Record arXiv digest state'
+            commit=$(git -C "$state_dir" rev-parse HEAD)
+            git push "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" \
+              "$commit:refs/heads/arxiv-digest-state"
+          fi
+
+      - name: Report digest failure
+        if: failure()
+        run: |
+          echo '::error::The daily digest failed. Check the failed step for retrieval, email or state storage errors.'
+          echo 'Daily digest failed. See the failed step for details.' >> "$GITHUB_STEP_SUMMARY"

@@ -1,9 +1,12 @@
 """Tests for ArxivRetriever."""
 
 import time
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import feedparser
+import pytest
+import requests
 
 from zotero_arxiv_daily.retriever.arxiv_retriever import ArxivRetriever, _run_with_hard_timeout
 import zotero_arxiv_daily.retriever.arxiv_retriever as arxiv_retriever
@@ -21,35 +24,10 @@ def _raise_runtime_error() -> None:
 def test_arxiv_retriever(config, mock_feedparser, monkeypatch):
     monkeypatch.setattr("zotero_arxiv_daily.retriever.base.sleep", lambda _: None)
 
-    # The RSS fixture gives us paper IDs.  After feedparser, the code calls
-    # arxiv.Client().results(search) which makes real HTTP requests.  We mock
-    # the arxiv Client so the test stays offline.
     new_entries = [
-        e for e in mock_feedparser.entries
-        if e.get("arxiv_announce_type", "new") == "new"
+        entry for entry in mock_feedparser.entries
+        if entry.get("arxiv_announce_type", "new") == "new"
     ]
-    paper_ids = [e.id.removeprefix("oai:arXiv.org:") for e in new_entries]
-
-    # Build fake ArxivResult-like objects matching each RSS entry
-    fake_results = []
-    for entry in new_entries:
-        pid = entry.id.removeprefix("oai:arXiv.org:")
-        fake_results.append(SimpleNamespace(
-            title=entry.title,
-            authors=[SimpleNamespace(name="Test Author")],
-            summary="Test abstract",
-            pdf_url=f"https://arxiv.org/pdf/{pid}",
-            entry_id=f"https://arxiv.org/abs/{pid}",
-            source_url=lambda pid=pid: f"https://arxiv.org/e-print/{pid}",
-        ))
-
-    class FakeClient:
-        def __init__(self, **kw):
-            pass
-        def results(self, search):
-            return iter(fake_results)
-
-    monkeypatch.setattr(arxiv_retriever.arxiv, "Client", FakeClient)
 
     # Skip file downloads in convert_to_paper
     monkeypatch.setattr(arxiv_retriever, "extract_text_from_html", lambda paper: None)
@@ -235,20 +213,101 @@ def test_retrieve_raw_papers_retries_on_http_failure(config, mock_feedparser, mo
     monkeypatch.setattr(arxiv_retriever, "sleep", lambda _: None)
     calls = []
 
-    def mock_parse_flaky(url):
-        calls.append(url)
-        if len(calls) < 2:
-            return SimpleNamespace(
-                status=500,
-                feed=SimpleNamespace(title="Server Error"),
-                entries=[],
-                bozo=False,
-            )
-        return mock_feedparser
+    original_get = requests.get
 
-    monkeypatch.setattr(arxiv_retriever.feedparser, "parse", mock_parse_flaky)
+    def mock_get_flaky(url, **kwargs):
+        calls.append(url)
+        if len(calls) == 1:
+            response = requests.Response()
+            response.status_code = 503
+            return response
+        return original_get(url, **kwargs)
+
+    monkeypatch.setattr(requests, "get", mock_get_flaky)
     retriever = ArxivRetriever(config)
     raw = retriever._retrieve_raw_papers()
     assert len(calls) == 2
     assert len(raw) > 0
 
+
+def test_api_fallback_recovers_empty_rss_and_filters_primary_category(config, monkeypatch):
+    now = datetime.now(timezone.utc)
+    published = (now - timedelta(hours=12)).isoformat()
+    old = (now - timedelta(hours=73)).isoformat()
+    config.source.arxiv.category = ["cs.AI"]
+    monkeypatch.setattr(arxiv_retriever, "sleep", lambda _: None)
+    calls = []
+
+    def get_page(self, url, *, params, timeout):
+        calls.append(dict(params))
+        index = params["start"]
+        arxiv_id, primary, date = [
+            ("2601.00001v1", "cs.AI", published),
+            ("2601.00002v1", "cs.LG", published),
+            ("2601.00003v1", "cs.AI", old),
+        ][index]
+        body = f"""
+        <feed xmlns="http://www.w3.org/2005/Atom"
+              xmlns:arxiv="http://arxiv.org/schemas/atom"
+              xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/">
+          <opensearch:totalResults>3</opensearch:totalResults>
+          <entry>
+            <id>http://arxiv.org/abs/{arxiv_id}</id>
+            <title>Test paper</title><summary>Abstract</summary>
+            <published>{date}</published><updated>{date}</updated>
+            <category term="cs.AI"/>
+            <arxiv:primary_category term="{primary}"/>
+          </entry>
+        </feed>
+        """
+        response = requests.Response()
+        response.status_code = 200
+        response._content = body.encode()
+        return response
+
+    monkeypatch.setattr(requests.Session, "get", get_page)
+    monkeypatch.setattr(
+        ArxivRetriever, "_fetch_rss", lambda self: feedparser.parse(
+            b'<feed xmlns="http://www.w3.org/2005/Atom"><title>arXiv</title></feed>'
+        )
+    )
+
+    papers = ArxivRetriever(config)._retrieve_raw_papers()
+
+    assert [paper.get_short_id() for paper in papers] == ["2601.00001v1"]
+    assert [call["start"] for call in calls] == [0, 1, 2]
+    assert "(cat:cs.AI) AND submittedDate:" in calls[0]["search_query"]
+
+
+def test_missed_run_backfills_even_when_rss_has_papers(config, mock_feedparser, tmp_path, monkeypatch):
+    from zotero_arxiv_daily.digest_state import DigestState, arxiv_id
+
+    state_path = tmp_path / "state.json"
+    monkeypatch.setenv("ARXIV_DIGEST_STATE", str(state_path))
+    state = DigestState(state_path, config.zotero.api_key, config.email.receiver)
+    entries = [entry for entry in mock_feedparser.entries if entry.arxiv_announce_type == "new"]
+    sent = arxiv_retriever._entry_to_arxiv_result(entries[0])
+    state.record([arxiv_id(sent.entry_id)], datetime.now(timezone.utc) - timedelta(hours=48))
+
+    duplicate = arxiv_retriever._entry_to_arxiv_result(entries[1])
+    duplicate.entry_id += "v2"
+    recovered = arxiv_retriever._entry_to_arxiv_result(entries[1])
+    recovered.entry_id = "https://arxiv.org/abs/2601.99999v1"
+    monkeypatch.setattr(ArxivRetriever, "_fetch_api", lambda self, now: [duplicate, recovered])
+
+    papers = ArxivRetriever(config)._retrieve_raw_papers()
+    ids = [arxiv_id(paper.entry_id) for paper in papers]
+    assert arxiv_id(sent.entry_id) not in ids
+    assert ids.count(arxiv_id(duplicate.entry_id)) == 1
+    assert "2601.99999" in ids
+    assert sent.get_short_id() not in state_path.read_text()
+
+
+def test_both_arxiv_sources_failing_is_an_error(config, monkeypatch):
+    def unavailable(*args):
+        raise RuntimeError("offline")
+
+    monkeypatch.setattr(ArxivRetriever, "_fetch_rss", unavailable)
+    monkeypatch.setattr(ArxivRetriever, "_fetch_api", unavailable)
+    with pytest.raises(RuntimeError, match="API fallback failed"):
+        ArxivRetriever(config)._retrieve_raw_papers()

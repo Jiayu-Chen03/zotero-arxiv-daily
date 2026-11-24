@@ -133,6 +133,19 @@ def test_send_email_starttls_success(config, monkeypatch):
     assert "text/html" in body
 
 
+def test_send_email_uses_implicit_tls_on_port_465(config, monkeypatch):
+    config.email.smtp_port = 465
+    sent = []
+
+    def unexpected_smtp(*args, **kwargs):
+        pytest.fail("Port 465 must open an implicit TLS connection")
+
+    monkeypatch.setattr(smtplib, "SMTP", unexpected_smtp)
+    monkeypatch.setattr(smtplib, "SMTP_SSL", make_stub_smtp(sent))
+    send_email(config, "<html>ssl</html>")
+    assert len(sent) == 1
+
+
 def test_send_email_falls_back_to_ssl(config, monkeypatch):
     sent = []
     call_count = {"smtp": 0}
@@ -144,6 +157,8 @@ def test_send_email_falls_back_to_ssl(config, monkeypatch):
             call_count["smtp"] += 1
         def starttls(self):
             raise OSError("TLS not supported")
+        def close(self):
+            pass
 
     class StubSMTP_SSL(StubOK):
         pass
@@ -169,6 +184,8 @@ def test_send_email_falls_back_to_plain(config, monkeypatch):
                 pass  # third SMTP() call is the plain fallback
         def starttls(self):
             raise OSError("TLS not supported")
+        def close(self):
+            pass
         def login(self, u, p):
             pass
         def sendmail(self, s, r, m):

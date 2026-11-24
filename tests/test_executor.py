@@ -148,14 +148,14 @@ def test_fetch_zotero_corpus_paper_with_zero_collections(config, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_run_end_to_end(config, monkeypatch):
+@pytest.mark.parametrize("smtp_accepted", [True, False])
+def test_run_end_to_end(config, monkeypatch, tmp_path, smtp_accepted):
     """Full pipeline: Zotero fetch -> filter -> retrieve -> rerank -> TLDR -> email."""
     import smtplib
 
     from omegaconf import open_dict
 
     from tests.canned_responses import (
-        make_sample_corpus,
         make_sample_paper,
         make_stub_openai_client,
         make_stub_smtp,
@@ -178,7 +178,7 @@ def test_run_end_to_end(config, monkeypatch):
     monkeypatch.setattr("zotero_arxiv_daily.reranker.api.OpenAI", lambda **kw: stub_client)
     retrieved = [
         make_sample_paper(title="E2E Paper 1", score=None),
-        make_sample_paper(title="E2E Paper 2", score=None),
+        make_sample_paper(title="E2E Paper 2", url="https://arxiv.org/abs/2026.00002v2", score=None),
     ]
 
     # Import to register the arxiv retriever
@@ -192,16 +192,35 @@ def test_run_end_to_end(config, monkeypatch):
         lambda self: retrieved,
     )
 
-    # 4. Stub SMTP
+    state_path = tmp_path / "state.json"
+    monkeypatch.setenv("ARXIV_DIGEST_STATE", str(state_path))
     sent = []
-    monkeypatch.setattr(smtplib, "SMTP", make_stub_smtp(sent))
+
+    class StubSMTP(make_stub_smtp(sent)):
+        def sendmail(self, sender, recipients, message):
+            if not smtp_accepted:
+                return {recipients[0]: (550, b"Rejected")}
+            return super().sendmail(sender, recipients, message)
+
+    monkeypatch.setattr(smtplib, "SMTP", StubSMTP)
 
     # 5. Stub sleep (reranker/retriever)
     monkeypatch.setattr("zotero_arxiv_daily.retriever.base.sleep", lambda _: None)
 
     # 6. Run
     executor = Executor(config)
+    if not smtp_accepted:
+        with pytest.raises(smtplib.SMTPRecipientsRefused):
+            executor.run()
+        assert not state_path.exists()
+        return
+
     executor.run()
+    from zotero_arxiv_daily.digest_state import DigestState
+
+    saved = DigestState(state_path, config.zotero.api_key, config.email.receiver)
+    assert saved.contains("2026.00001")
+    assert saved.contains("2026.00002")
 
     # Assertions
     assert len(sent) == 1, "Email should have been sent"

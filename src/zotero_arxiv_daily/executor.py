@@ -4,6 +4,7 @@ from omegaconf import DictConfig, ListConfig
 from .utils import glob_match
 from .retriever import get_retriever_cls
 from .protocol import CorpusPaper
+import os
 import random
 from datetime import datetime
 from .reranker import get_reranker_cls
@@ -37,6 +38,10 @@ class Executor:
         self.retrievers = {
             source: get_retriever_cls(source)(config) for source in config.executor.source
         }
+        self.arxiv = self.retrievers.get("arxiv")
+        if self.arxiv is not None:
+            self.arxiv.defer_full_text = True
+            self.arxiv.conversion_delay = 0
         self.reranker = get_reranker_cls(config.executor.reranker)(config)
         self.openai_client = OpenAI(api_key=config.llm.api.key, base_url=config.llm.api.base_url)
     def fetch_zotero_corpus(self) -> list[CorpusPaper]:
@@ -90,35 +95,45 @@ class Executor:
         return corpus
 
     
+    @staticmethod
+    def _report_status(message: str) -> None:
+        logger.info(message)
+        if summary := os.getenv("GITHUB_STEP_SUMMARY"):
+            with open(summary, "a", encoding="utf-8") as file:
+                file.write(f"{message}\n")
+
     def run(self):
-        corpus = self.fetch_zotero_corpus()
-        corpus = self.filter_corpus(corpus)
-        if len(corpus) == 0:
-            logger.error(f"No zotero papers found. Please check your zotero settings:\n{self.config.zotero}")
-            return
+        corpus = self.filter_corpus(self.fetch_zotero_corpus())
+        if not corpus:
+            raise RuntimeError("No Zotero papers matched the configured collections.")
+
         all_papers = []
         for source, retriever in self.retrievers.items():
             logger.info(f"Retrieving {source} papers...")
             papers = retriever.retrieve_papers()
-            if len(papers) == 0:
-                logger.info(f"No {source} papers found")
-                continue
             logger.info(f"Retrieved {len(papers)} {source} papers")
             all_papers.extend(papers)
         logger.info(f"Total {len(all_papers)} papers retrieved from all sources")
+
         reranked_papers = []
-        if len(all_papers) > 0:
-            logger.info("Reranking papers...")
+        if all_papers:
             reranked_papers = self.reranker.rerank(all_papers, corpus)
             reranked_papers = reranked_papers[:self.config.executor.max_paper_num]
-            logger.info("Generating TLDR and affiliations...")
-            for p in tqdm(reranked_papers):
-                p.generate_tldr(self.openai_client, self.config.llm)
-                p.generate_affiliations(self.openai_client, self.config.llm)
-        elif not self.config.executor.send_empty:
-            logger.info("No new papers found. No email will be sent.")
+        if not reranked_papers and not self.config.executor.send_empty:
+            if self.arxiv is not None:
+                self.arxiv.record_delivery([])
+            self._report_status("Email skipped: no unsent papers selected for this digest.")
             return
+
+        logger.info("Generating TLDR and affiliations...")
+        for paper in tqdm(reranked_papers):
+            if paper.source == "arxiv" and self.arxiv is not None:
+                self.arxiv.enrich_paper(paper)
+            paper.generate_tldr(self.openai_client, self.config.llm)
+            paper.generate_affiliations(self.openai_client, self.config.llm)
+
         logger.info("Sending email...")
-        email_content = render_email(reranked_papers)
-        send_email(self.config, email_content)
-        logger.info("Email sent successfully")
+        send_email(self.config, render_email(reranked_papers))
+        if self.arxiv is not None:
+            self.arxiv.record_delivery(reranked_papers)
+        self._report_status(f"Email sent successfully ({len(reranked_papers)} papers).")

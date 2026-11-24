@@ -155,17 +155,31 @@ def send_email(config:DictConfig, html:str):
     today = datetime.datetime.now().strftime('%Y/%m/%d')
     msg['Subject'] = Header(f'Daily arXiv {today}', 'utf-8').encode()
 
-    try:
-        server = smtplib.SMTP(smtp_server, smtp_port)
-        server.starttls()
-    except Exception as e:
-        logger.debug(f"Failed to use TLS. {e}\nTry to use SSL.")
+    if int(smtp_port) == 465:
+        server = smtplib.SMTP_SSL(smtp_server, smtp_port, timeout=30)
+    else:
         try:
-            server = smtplib.SMTP_SSL(smtp_server, smtp_port)
-        except Exception as e:
-            logger.debug(f"Failed to use SSL. {e}\nTry to use plain text.")
-            server = smtplib.SMTP(smtp_server, smtp_port)
+            server = smtplib.SMTP(smtp_server, smtp_port, timeout=30)
+            try:
+                server.starttls()
+            except Exception:
+                server.close()
+                raise
+        except (OSError, smtplib.SMTPException) as exc:
+            logger.debug(f"Could not use STARTTLS ({exc}); trying SMTP over SSL.")
+            try:
+                server = smtplib.SMTP_SSL(smtp_server, smtp_port, timeout=30)
+            except (OSError, smtplib.SMTPException) as exc:
+                logger.debug(f"Could not use SMTP over SSL ({exc}); trying plain SMTP.")
+                server = smtplib.SMTP(smtp_server, smtp_port, timeout=30)
 
-    server.login(sender, password)
-    server.sendmail(sender, [receiver], msg.as_string())
-    server.quit()
+    try:
+        server.login(sender, password)
+        refused = server.sendmail(sender, [receiver], msg.as_string())
+        if refused:
+            raise smtplib.SMTPRecipientsRefused(refused)
+    finally:
+        try:
+            server.quit()
+        except (OSError, smtplib.SMTPException) as exc:
+            logger.warning(f"SMTP connection could not be closed cleanly: {exc}")

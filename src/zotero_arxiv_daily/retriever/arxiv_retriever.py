@@ -1,26 +1,30 @@
 from .base import BaseRetriever, register_retriever
-import arxiv
+from ..digest_state import DigestState, arxiv_id
 from arxiv import Result as ArxivResult
 from ..protocol import Paper
 from ..utils import extract_markdown_from_pdf, extract_tex_code_from_tar
 import calendar
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import multiprocessing
 import os
+from pathlib import Path
 from queue import Empty
 import re
 from tempfile import TemporaryDirectory
-import time
 from time import sleep
 from typing import Any, Callable, TypeVar
 from loguru import logger
 import requests
 import feedparser
-from tqdm import tqdm
 
 T = TypeVar("T")
 
 DOWNLOAD_TIMEOUT = (10, 60)
+FEED_TIMEOUT = (10, 30)
+API_URL = "https://export.arxiv.org/api/query"
+API_PAGE_SIZE = 200
+BACKFILL_WINDOW = timedelta(hours=72)
+MISSED_RUN_GAP = timedelta(hours=36)
 PDF_EXTRACT_TIMEOUT = 180
 TAR_EXTRACT_TIMEOUT = 180
 
@@ -151,6 +155,8 @@ def _parse_entry_time(struct_time: Any) -> datetime:
 def _entry_to_arxiv_result(entry: Any) -> ArxivResult:
     raw_id = getattr(entry, "id", "") or ""
     paper_id = raw_id.removeprefix("oai:arXiv.org:")
+    if "://" in paper_id:
+        paper_id = paper_id.partition("/abs/")[2]
     title_raw = getattr(entry, "title", "") or ""
     title = " ".join(title_raw.split())
 
@@ -158,6 +164,7 @@ def _entry_to_arxiv_result(entry: Any) -> ArxivResult:
     summary = _clean_abstract(getattr(entry, "summary", "") or "")
 
     link = getattr(entry, "link", "") or f"https://arxiv.org/abs/{paper_id}"
+    link = link.replace("http://arxiv.org/", "https://arxiv.org/", 1)
     pdf_url = f"https://arxiv.org/pdf/{paper_id}"
     source_url = f"https://arxiv.org/src/{paper_id}"
 
@@ -211,90 +218,161 @@ def _entry_to_arxiv_result(entry: Any) -> ArxivResult:
 class ArxivRetriever(BaseRetriever):
     def __init__(self, config):
         super().__init__(config)
-        if self.config.source.arxiv.category is None:
+        if not self.retriever_config.category:
             raise ValueError("category must be specified for arxiv.")
+        self.categories = set(self.retriever_config.category)
+        self.include_cross_list = self.retriever_config.get("include_cross_list", False)
+        self.defer_full_text = False
+        self._raw_by_url: dict[str, ArxivResult] = {}
+        self._retrieved_at = None
+        self.state = None
+        state_path = os.getenv("ARXIV_DIGEST_STATE")
+        if state_path and not config.executor.debug:
+            self.state = DigestState(Path(state_path), config.zotero.api_key, config.email.receiver)
+
+    def _fetch_rss(self):
+        query = "+".join(sorted(self.categories))
+        url = f"https://rss.arxiv.org/atom/{query}"
+        for attempt in range(5):
+            try:
+                response = requests.get(url, timeout=FEED_TIMEOUT)
+                response.raise_for_status()
+                feed = feedparser.parse(response.content)
+                title = feed.feed.get("title", "")
+                if "Feed error for query" in title:
+                    raise ValueError(f"Invalid arXiv categories: {query}")
+                if not title or (feed.bozo and not feed.entries):
+                    raise RuntimeError("Invalid arXiv RSS response")
+                return feed
+            except (requests.RequestException, RuntimeError) as exc:
+                if attempt == 4:
+                    raise RuntimeError("Could not retrieve arXiv RSS after 5 attempts") from exc
+                logger.warning(f"arXiv RSS attempt {attempt + 1} failed: {exc}")
+                sleep(5)
+
+    def _fetch_api(self, now: datetime) -> list[ArxivResult]:
+        since = now - BACKFILL_WINDOW
+        categories = " OR ".join(f"cat:{category}" for category in sorted(self.categories))
+        date_range = f"[{since:%Y%m%d%H%M} TO {now:%Y%m%d%H%M}]"
+        params = {
+            "search_query": f"({categories}) AND submittedDate:{date_range}",
+            "sortBy": "submittedDate",
+            "sortOrder": "descending",
+            "max_results": API_PAGE_SIZE,
+            "start": 0,
+        }
+
+        papers = []
+        with requests.Session() as session:
+            while True:
+                for attempt in range(3):
+                    try:
+                        response = session.get(API_URL, params=params, timeout=FEED_TIMEOUT)
+                        response.raise_for_status()
+                        feed = feedparser.parse(response.content)
+                        total = int(feed.feed.get("opensearch_totalresults", -1))
+                        valid_ids = all("/abs/" in entry.get("id", "") for entry in feed.entries)
+                        if feed.bozo or not valid_ids or total < 0 or (not feed.entries and params["start"] < total):
+                            raise RuntimeError("Invalid or incomplete arXiv API response")
+                        break
+                    except (requests.RequestException, RuntimeError, ValueError) as exc:
+                        if attempt == 2:
+                            raise RuntimeError("Could not retrieve an arXiv API page after 3 attempts") from exc
+                        logger.warning(f"arXiv API attempt {attempt + 1} failed: {exc}")
+                        sleep(3)
+
+                for entry in feed.entries:
+                    paper = _entry_to_arxiv_result(entry)
+                    if since <= paper.published <= now and (
+                        self.include_cross_list or paper.primary_category in self.categories
+                    ):
+                        papers.append(paper)
+                params["start"] += len(feed.entries)
+                if params["start"] >= total:
+                    break
+                sleep(3)
+
+        logger.info(f"arXiv API 72-hour backfill (submission time): {len(papers)} eligible papers")
+        return papers
 
     def _retrieve_raw_papers(self) -> list[ArxivResult]:
-        query = '+'.join(self.config.source.arxiv.category)
-        include_cross_list = self.config.source.arxiv.get("include_cross_list", False)
-        rss_url = f"https://rss.arxiv.org/atom/{query}"
-
-        # Get latest papers from arxiv RSS feed with retry
-        retry_num = 5
-        delay_time = 5
-        feed = None
-        for attempt in range(retry_num):
-            feed = feedparser.parse(rss_url)
-            status = getattr(feed, "status", None)
-            bozo = getattr(feed, "bozo", False)
-            bozo_exc = getattr(feed, "bozo_exception", None)
-            feed_meta = getattr(feed, "feed", None)
-            title = getattr(feed_meta, "title", "") if feed_meta else ""
-
-            if title and "Feed error for query" in title:
-                raise Exception(f"Invalid ARXIV_QUERY: {query}.")
-
-            # Validate HTTP status and parser state before accepting the feed
-            is_http_error = status is not None and status >= 400
-            is_parser_error = bool(bozo and not getattr(feed, "entries", None))
-            has_valid_feed = bool(feed_meta and title and not is_http_error and not is_parser_error)
-
-            if has_valid_feed:
-                break
-
-            error_msg = f"status={status}" if status is not None else f"bozo_exception={bozo_exc}"
-            if attempt < retry_num - 1:
-                logger.warning(
-                    f"Failed to fetch valid arxiv RSS feed ({error_msg}), retrying in {delay_time}s..."
-                )
-                sleep(delay_time)
+        now = datetime.now(timezone.utc)
+        self._retrieved_at = None
+        papers = {}
+        feed_is_stale = False
+        try:
+            feed = self._fetch_rss()
+        except RuntimeError as exc:
+            logger.warning(f"{exc}; falling back to the arXiv API")
         else:
-            status = getattr(feed, "status", None)
-            bozo_exc = getattr(feed, "bozo_exception", None)
-            raise RuntimeError(
-                f"Failed to fetch valid arxiv RSS feed from {rss_url} after {retry_num} attempts "
-                f"(status={status}, bozo_exception={bozo_exc})"
+            updated = feed.feed.get("updated_parsed")
+            feed_is_stale = bool(updated and now - _parse_entry_time(updated) >= MISSED_RUN_GAP)
+            allowed = {"new", "cross"} if self.include_cross_list else {"new"}
+            for entry in feed.entries:
+                if entry.get("arxiv_announce_type", "new") in allowed:
+                    paper = _entry_to_arxiv_result(entry)
+                    papers.setdefault(arxiv_id(paper.entry_id), paper)
+            logger.info(
+                f"arXiv RSS announcement feed updated {feed.feed.get('updated', 'unknown')}: "
+                f"{len(feed.entries)} entries, {len(papers)} eligible unique papers"
             )
 
-        allowed_announce_types = {"new", "cross"} if include_cross_list else {"new"}
-        target_entries = [
-            i for i in feed.entries
-            if i.get("arxiv_announce_type", "new") in allowed_announce_types
+        gap = self.state is not None and (
+            self.state.last_retrieved_at is None
+            or now - self.state.last_retrieved_at >= MISSED_RUN_GAP
+        )
+        if not papers or gap or (self.state is not None and feed_is_stale):
+            try:
+                for paper in self._fetch_api(now):
+                    papers.setdefault(arxiv_id(paper.entry_id), paper)
+            except RuntimeError as exc:
+                if not papers:
+                    raise RuntimeError("arXiv RSS yielded no eligible papers and API fallback failed") from exc
+                logger.warning(f"{exc}; using RSS and keeping the recovery window open")
+            else:
+                self._retrieved_at = now
+        else:
+            self._retrieved_at = now
+
+        remaining = [
+            paper for paper_id, paper in papers.items()
+            if self.state is None or not self.state.contains(paper_id)
         ]
-        if self.config.executor.debug:
-            target_entries = target_entries[:10]
+        logger.info(f"arXiv delivery history excluded {len(papers) - len(remaining)} already sent papers")
+        return remaining[:10] if self.config.executor.debug else remaining
 
-        seen_paper_ids = set()
-        raw_papers = []
-        for entry in target_entries:
-            raw_id = getattr(entry, "id", "") or ""
-            paper_id = raw_id.removeprefix("oai:arXiv.org:")
-            if paper_id and paper_id in seen_paper_ids:
-                continue
-            if paper_id:
-                seen_paper_ids.add(paper_id)
-            raw_papers.append(_entry_to_arxiv_result(entry))
+    def record_delivery(self, delivered: list[Paper]) -> None:
+        if self.state is not None:
+            self.state.record(
+                [arxiv_id(paper.url) for paper in delivered if paper.source == self.name],
+                self._retrieved_at,
+            )
 
-        return raw_papers
+    @staticmethod
+    def _extract_full_text(raw_paper: ArxivResult) -> str | None:
+        return (
+            extract_text_from_tar(raw_paper)
+            or extract_text_from_html(raw_paper)
+            or extract_text_from_pdf(raw_paper)
+        )
+
+    def enrich_paper(self, paper: Paper) -> None:
+        raw_paper = self._raw_by_url.get(paper.url)
+        if raw_paper is not None:
+            paper.full_text = self._extract_full_text(raw_paper)
+            sleep(1)
 
     def convert_to_paper(self, raw_paper: ArxivResult) -> Paper:
-        title = raw_paper.title
-        authors = [a.name for a in raw_paper.authors]
-        abstract = raw_paper.summary
-        pdf_url = raw_paper.pdf_url
-        full_text = extract_text_from_tar(raw_paper)
-        if full_text is None:
-            full_text = extract_text_from_html(raw_paper)
-        if full_text is None:
-            full_text = extract_text_from_pdf(raw_paper)
+        if self.defer_full_text:
+            self._raw_by_url[raw_paper.entry_id] = raw_paper
         return Paper(
             source=self.name,
-            title=title,
-            authors=authors,
-            abstract=abstract,
+            title=raw_paper.title,
+            authors=[author.name for author in raw_paper.authors],
+            abstract=raw_paper.summary,
             url=raw_paper.entry_id,
-            pdf_url=pdf_url,
-            full_text=full_text,
+            pdf_url=raw_paper.pdf_url,
+            full_text=None if self.defer_full_text else self._extract_full_text(raw_paper),
         )
 
 
