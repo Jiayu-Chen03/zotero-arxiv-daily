@@ -1,9 +1,6 @@
 name: Send emails daily
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths: ['.github/workflows/main.yml']
   schedule:
     # 10:17 Monday–Friday in Beijing, after the arXiv announcement.
     - cron: '17 2 * * 1-5'
@@ -14,7 +11,6 @@ concurrency:
 
 jobs:
   calculate-and-send:
-    if: github.event_name != 'push' || github.event.head_commit.message == 'Fix scheduled arXiv digest delivery'
     runs-on: ubuntu-24.04
     permissions:
       contents: write
